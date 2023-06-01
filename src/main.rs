@@ -148,10 +148,9 @@ impl State {
 
     async fn msg_handler(&mut self, client: &mut SpiderClient, msg: Message) {
         match msg {
-            Message::Peripheral(_) => {}
             Message::Ui(msg) => self.ui_handler(client, msg).await,
             Message::Dataset(msg) => self.dataset_handler(client, msg).await,
-            Message::Event(_) => {}
+            Message::Router(_) => {}
         }
     }
 
