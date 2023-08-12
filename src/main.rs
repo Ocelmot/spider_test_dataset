@@ -2,68 +2,42 @@ use std::{io, path::PathBuf};
 
 use spider_client::{
     message::{
-        DatasetMessage, DatasetPath, Message, UiElement,
-        UiElementContent, UiElementContentPart, UiElementKind, UiMessage, UiPageManager, UiPath, UiInput,
+        DatasetMessage, DatasetPath, Message, UiElement, UiElementContent, UiElementContentPart,
+        UiElementKind, UiInput, UiMessage, UiPageManager, UiPath,
     },
-    AddressStrategy, Relation, Role, SpiderClient, SpiderId2048,
+    ClientChannel, ClientResponse, SpiderClientBuilder,
 };
 
 #[tokio::main]
-async fn main() -> Result<(), io::Error> {
-    println!("Hello, world!");
-
+async fn main() {
     let client_path = PathBuf::from("client_state.dat");
-    let mut client = if client_path.exists() {
-        SpiderClient::from_file(&client_path)
-    } else {
-        let mut client = SpiderClient::new();
-        client.set_state_path(&client_path);
-        client.add_strat(AddressStrategy::Addr(String::from("localhost:1930")));
-        client.save();
-        client
-    };
 
-    if !client.has_host_relation() {
-        let path = PathBuf::from("spider_keyfile.json");
+    let mut builder = SpiderClientBuilder::load_or_set(&client_path, |builder| {
+        builder.enable_fixed_addrs(true);
+        builder.set_fixed_addrs(vec!["localhost:1930".into()]);
+    });
 
-        let data = match std::fs::read_to_string(&path) {
-            Ok(str) => str,
-            Err(_) => String::from("[]"),
-        };
-        let id: SpiderId2048 = serde_json::from_str(&data).expect("Failed to deserialize spiderid");
-        let host = Relation {
-            id,
-            role: Role::Peer,
-        };
-        client.set_host_relation(host);
-        client.save();
-    }
+    builder.try_use_keyfile("spider_keyfile.json").await;
 
-    client.connect().await;
-    let mut state = State::init(&mut client).await;
+    let mut client_channel = builder.start(true);
+    let mut state = State::init(&mut client_channel).await;
 
     loop {
-        match client.recv().await {
-            Some(msg) => state.msg_handler(&mut client, msg).await,
+        match client_channel.recv().await {
+            Some(ClientResponse::Message(msg)) => {
+                state.msg_handler(&mut client_channel, msg).await;
+            }
+            Some(ClientResponse::Denied(_)) => break,
             None => break, //  done!
+            _ => {}
         }
     }
-
-    Ok(())
 }
 
 struct State {}
 
 impl State {
-    async fn init(client: &mut SpiderClient) -> Self {
-        // let id = client.self_relation().id;
-
-        // Set dataset
-        // let data = spider_client::message::DatasetData::String(String::from("Test Data String!"));
-        // let msg = Message::Dataset(DatasetMessage::Append { path: DatasetPath::new_private(vec![String::from("Test")]), data });
-
-        // client.send(msg).await;
-
+    async fn init(client: &mut ClientChannel) -> Self {
         // Subscribe to dataset
         let dataset_path = DatasetPath::new_private(vec![String::from("Test")]);
         let msg = Message::Dataset(DatasetMessage::Subscribe {
@@ -73,7 +47,7 @@ impl State {
         client.send(msg).await;
 
         // setup page
-        let id = client.self_relation().id;
+        let id = client.id();
         let mut test_page = UiPageManager::new(id.clone(), "Dataset Test Page");
         let mut root = test_page
             .get_element_mut(&UiPath::root())
@@ -84,7 +58,6 @@ impl State {
             let mut element = UiElement::new(UiElementKind::Rows);
             element.set_dataset(Some(dataset_path.clone().resolve(id.clone())));
             element.append_child({
-
                 let mut child = UiElement::new(UiElementKind::Columns);
                 child.append_child({
                     let mut child = UiElement::new(UiElementKind::Text);
@@ -93,18 +66,12 @@ impl State {
                     child.set_content(content);
                     child
                 });
+                child.append_child(UiElement::new(UiElementKind::Spacer));
                 child.append_child({
                     let mut child = UiElement::new(UiElementKind::Button);
                     child.set_id("delete row");
                     child.set_selectable(true);
                     child.set_text("Delete!");
-                    child
-                });
-                child.append_child({
-                    let mut child = UiElement::new(UiElementKind::Button);
-                    child.set_id("add row");
-                    child.set_selectable(true);
-                    child.set_text("Add!");
                     child
                 });
                 child
@@ -146,31 +113,23 @@ impl State {
         Self {}
     }
 
-    async fn msg_handler(&mut self, client: &mut SpiderClient, msg: Message) {
+    async fn msg_handler(&mut self, client: &mut ClientChannel, msg: Message) {
         match msg {
             Message::Ui(msg) => self.ui_handler(client, msg).await,
             Message::Dataset(msg) => self.dataset_handler(client, msg).await,
             Message::Router(_) => {}
+            Message::Error(_) => {}
         }
     }
 
-    async fn dataset_handler(&mut self, _client: &mut SpiderClient, msg: DatasetMessage) {
+    async fn dataset_handler(&mut self, _client: &mut ClientChannel, msg: DatasetMessage) {
         println!("Message: {:?}", msg);
         if let DatasetMessage::Dataset { path: _, data } = msg {
             println!("Data: {:?}", data.get(0))
         }
-        // match msg{
-        //     DatasetMessage::Subscribe { path } => todo!(),
-        //     DatasetMessage::Append { path, data } => todo!(),
-        //     DatasetMessage::Extend { path, data } => todo!(),
-        //     DatasetMessage::SetElement { path, data, id } => todo!(),
-        //     DatasetMessage::SetElements { path, data, id } => todo!(),
-        //     DatasetMessage::DeleteElement { path, id } => todo!(),
-        //     DatasetMessage::Dataset { path, data } => todo!(),
-        // }
     }
 
-    async fn ui_handler(&mut self, client: &mut SpiderClient, msg: UiMessage) {
+    async fn ui_handler(&mut self, client: &mut ClientChannel, msg: UiMessage) {
         match msg {
             UiMessage::Subscribe => {}
             UiMessage::Pages(_) => {}
@@ -207,9 +166,9 @@ impl State {
                             id: *dataset_ids.last().unwrap_or(&0),
                         });
                         client.send(msg).await;
-                    },
+                    }
                     "TextInput" => {
-                        if let UiInput::Text(text) = change{
+                        if let UiInput::Text(text) = change {
                             let data = spider_client::message::DatasetData::String(text);
                             let msg = Message::Dataset(DatasetMessage::Append {
                                 path: dataset_path,
@@ -217,7 +176,7 @@ impl State {
                             });
                             client.send(msg).await;
                         }
-                    },
+                    }
                     _ => return,
                 }
             }
